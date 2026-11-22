@@ -27,7 +27,7 @@ jobs:
         run: go build -trimpath -ldflags "-s -w -H=windowsgui" -o f2n.exe .
 
       - name: Сборка GUI
-        run: go build -trimpath -tags desktop,production -ldflags "-s -w -H=windowsgui" -o f2n-gui.exe .
+        run: go build -trimpath -tags desktop,production -ldflags "-s -w -H=windowsgui" -o ..\f2n-gui.exe .
         working-directory: gui
 
       - name: Упаковка
