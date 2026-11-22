@@ -1,4 +1,4 @@
-# F2N — Flowseal → NFQWS 2 Converter
+# F2N — Flowseal → NFQWS 2 Converter Keenetic/Netcraze
 
 Конвертер профилей [Flowseal/zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube)
 (`.bat`) в каноничный конфиг [nfqws2-keenetic](https://github.com/nfqws/nfqws2-keenetic).
