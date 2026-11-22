@@ -1,0 +1,28 @@
+# Сборка
+*.exe
+mkico.exe
+
+# Каталоги результатов и установки (создаются программой на ПК пользователя)
+converted/
+last-deploy/
+backups/
+Ready/
+F2N/
+deploy-backup/
+
+# Сгенерированные ресурсы (пересоздаются tools/mkico)
+winres/icon-multi.ico
+
+# Тестовые артефакты и диагностика
+testdata/smoke*/
+testdata/out-*/
+*.log
+*.err
+
+# Скриншоты и личные артефакты
+*.png
+*.zip
+*.tmp
+mgr.txt
+cj*.txt
+restore.ps1
