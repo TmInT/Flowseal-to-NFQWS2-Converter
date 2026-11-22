@@ -42,9 +42,11 @@ func TestGolden(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if normalize(res.Conf) != normalize(want) {
-				wantLines := strings.Split(normalize(want), "\n")
-				gotLines := strings.Split(normalize(res.Conf), "\n")
+			wantStr := normalize(string(want))
+			gotStr := normalize(res.Conf)
+			if gotStr != wantStr {
+				wantLines := strings.Split(wantStr, "\n")
+				gotLines := strings.Split(gotStr, "\n")
 				for i := 0; i < len(wantLines) || i < len(gotLines); i++ {
 					var w, g string
 					if i < len(wantLines) {
