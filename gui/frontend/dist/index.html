@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
@@ -42,6 +42,11 @@ textarea {
 .badge.warn { background: rgba(224,166,58,.15); color: var(--warn); }
 .check { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 13px; }
 #status { min-height: 20px; font-size: 13px; color: var(--dim); margin-top: 8px; white-space: pre-wrap; }
+.progress { height: 6px; background: var(--panel2); border-radius: 3px; overflow: hidden; margin-bottom: 6px; }
+#progbar { height: 100%; width: 0%; background: var(--accent); transition: width .3s; }
+#progtext { font-size: 12px; color: var(--dim); margin-bottom: 8px; min-height: 16px; }
+#listeditor { width: 100%; height: 150px; background: #14161b; color: #c9d2e0; border: 1px solid var(--line);
+  border-radius: 8px; padding: 8px; font: 12px/1.4 Consolas, monospace; resize: vertical; outline: none; white-space: pre; }
 .note { color: var(--dim); font-size: 12px; margin-top: 8px; }
 .footer { position: fixed; right: 10px; bottom: 6px; color: #5a6070; font-size: 11px; user-select: none; }
 </style>
@@ -76,8 +81,8 @@ textarea {
           <div class="check" title="Строгий режим: любое предупреждение конвертации считается ошибкой — работа останавливается, ничего не заменяется безопасными эквивалентами"><input type="checkbox" id="strict"><span>Строгий режим</span></div>
         </div>
         <div class="row">
-          <button class="primary" onclick="doPreview()">Конвертировать</button>
-          <button onclick="doExport()" title="Сохранить nfqws2.conf, REPORT и списки в папку рядом с программой — установку можно сделать позже">Сохранить локально…</button>
+          <button class="primary" id="previewBtn" onclick="doPreview()">Конвертировать</button>
+          <button id="exportBtn" onclick="doExport()" title="Сохранить nfqws2.conf, REPORT и списки в папку рядом с программой — установку можно сделать позже">Сохранить локально…</button>
         </div>
       </div>
 
@@ -92,9 +97,9 @@ textarea {
           <label style="min-width:70px">Пароль SSH</label><input type="password" id="pass">
         </div>
         <div class="row">
-          <button onclick="doCheck()" title="Проверить SSH-доступ, наличие конфига и статус службы">Проверить</button>
-          <button class="primary" onclick="doDeploy()" title="Бэкап текущего конфига → запись нового (блобы внутри конфига) → слияние списков → restart → статус. При сбое restart — автооткат.">Установить на роутер</button>
-          <button class="danger" onclick="svc('restart')" title="Просто перезапуск службы nfqws2 по SSH. Откат конфига выполняется автоматически кнопкой «Установить» при сбое restart.">Перезапуск</button>
+          <button id="checkBtn" onclick="doCheck()" title="Проверить SSH-доступ, наличие конфига и статус службы">Проверить</button>
+          <button class="primary" id="deployBtn" onclick="doDeploy()" title="Бэкап текущего конфига → запись нового (блобы внутри конфига) → слияние списков → restart → статус. При сбое restart — автооткат.">Установить на роутер</button>
+          <button class="danger" id="restartBtn" onclick="svc('restart')" title="Просто перезапуск службы nfqws2 по SSH. Откат конфига выполняется автоматически кнопкой «Установить» при сбое restart.">Перезапуск</button>
         </div>
         <div class="row">
           <button onclick="svc('status')" title="S51nfqws2 status + количество правил в iptables">Статус</button>
@@ -115,7 +120,27 @@ textarea {
           <button onclick="pickFolder('kitdir')">Обзор…</button>
         </div>
         <div class="row">
-          <button class="primary" onclick="doDeployFromFolder()" title="Установить nfqws2.conf и списки из выбранной папки (предыдущая конвертация «Сохранить локально…»)">Установить из папки</button>
+          <button class="primary" id="deployFolderBtn" onclick="doDeployFromFolder()" title="Установить nfqws2.conf и списки из выбранной папки (предыдущая конвертация «Сохранить локально…»)">Установить из папки</button>
+        </div>
+      </div>
+
+      <div class="section">
+        <b>4 · Списки роутера</b>
+        <div class="row">
+          <label>Список</label>
+          <select id="listname">
+            <option>user.list</option>
+            <option>exclude.list</option>
+            <option>auto.list</option>
+            <option>ipset.list</option>
+            <option>ipset_exclude.list</option>
+          </select>
+          <button onclick="doLoadList()" title="Прочитать список с роутера">Загрузить</button>
+        </div>
+        <textarea id="listeditor" spellcheck="false" placeholder="Нажмите «Загрузить», чтобы отредактировать список с роутера"></textarea>
+        <div class="row" style="margin-top:8px">
+          <button class="primary" onclick="doSaveList()" title="Сохранить список на роутер. Предыдущая версия сохраняется как .bak-f2n-<дата>">Сохранить на роутер</button>
+          <button onclick="doLoadList()">Отменить правки</button>
         </div>
       </div>
     </div>
@@ -124,6 +149,8 @@ textarea {
   <div class="col">
     <div class="card" style="flex:1; display:flex; flex-direction:column;">
       <h2>Результат</h2>
+      <div class="progress" id="progwrap" style="display:none"><div id="progbar"></div></div>
+      <div id="progtext"></div>
       <div id="badges"></div>
       <textarea id="out" spellcheck="false" placeholder="Здесь появится конфиг и лог операций…"></textarea>
     </div>
@@ -212,27 +239,56 @@ async function doCheck() {
     saveSettings();
   } catch (e) { status("Роутер недоступен: " + e, "err"); }
 }
+function busy(on) {
+  ["deployBtn", "deployFolderBtn", "checkBtn", "restartBtn", "previewBtn", "exportBtn"].forEach(id => { const b = $(id); if (b) b.disabled = on; });
+  $("progwrap").style.display = on ? "block" : "none";
+}
+function setProgress(step, total, msg) {
+  $("progbar").style.width = Math.round(100 * step / total) + "%";
+  $("progtext").textContent = "Шаг " + step + "/" + total + ": " + msg;
+}
+window.addEventListener("DOMContentLoaded", () => {
+  try { window.runtime.EventsOn("deploy:progress", d => { setProgress(d.step, d.total, d.msg); log(d.msg); }); } catch (e) {}
+  loadSettings();
+});
 async function doDeploy() {
   if (!confirm("Установить конфиг на роутер? Предыдущий будет сохранён как .bak-f2n-*")) return;
-  status("Деплой…");
+  busy(true); $("out").value = ""; status("Деплой…");
   try {
     const logs = await window.go.main.App.DeploySSH(opts(), router(), $("updlists").checked);
     $("out").value = logs.join("\n");
     status("Установлено — проверьте Discord/YouTube", "ok");
     saveSettings();
   } catch (e) { status("Ошибка деплоя: " + e, "err"); log("ОШИБКА: " + e); }
+  finally { busy(false); }
 }
 async function doDeployFromFolder() {
   const dir = $("kitdir").value.trim();
   if (!dir) { status("Укажите папку с конвертацией (там должен быть nfqws2.conf)", "warn"); return; }
   if (!confirm("Установить конфиг из папки «" + dir + "»? Текущий будет сохранён как .bak-f2n-*")) return;
-  status("Деплой из папки…");
+  busy(true); $("out").value = ""; status("Деплой из папки…");
   try {
     const logs = await window.go.main.App.DeployFromFolder(router(), dir, $("updlists").checked);
     $("out").value = logs.join("\n");
     status("Установлено — проверьте Discord/YouTube", "ok");
     saveSettings();
   } catch (e) { status("Ошибка деплоя: " + e, "err"); log("ОШИБКА: " + e); }
+  finally { busy(false); }
+}
+async function doLoadList() {
+  try {
+    const content = await window.go.main.App.LoadList(router(), $("listname").value);
+    $("listeditor").value = content;
+    status("Список " + $("listname").value + " загружен (" + content.split("\n").filter(l => l.trim()).length + " строк)", "ok");
+  } catch (e) { status("Ошибка: " + e, "err"); }
+}
+async function doSaveList() {
+  const name = $("listname").value;
+  if (!confirm("Сохранить список «" + name + "» на роутер? Предыдущая версия сохранится как .bak-f2n-*")) return;
+  try {
+    const bak = await window.go.main.App.SaveList(router(), name, $("listeditor").value);
+    status("Список " + name + " сохранён. Бэкап: " + bak, "ok");
+  } catch (e) { status("Ошибка: " + e, "err"); }
 }
 async function svc(action) {
   try {
@@ -247,7 +303,7 @@ async function doLog() {
     $("out").value = "=== /opt/var/log/nfqws2.log (последние 50) ===\n" + out;
   } catch (e) { status("Ошибка: " + e, "err"); }
 }
-window.addEventListener("DOMContentLoaded", loadSettings);
+
 </script>
 </body>
 </html>

@@ -10,7 +10,7 @@ import (
 func TestPreviewResolvesBatFilename(t *testing.T) {
 	a := NewApp()
 	res, err := a.Preview(ConvertOpts{
-		Dir:   `G:\zapret-discord-youtube-1.10.4`,
+		Dir:   `../testdata/flowseal`,
 		Bat:   "general (ALT11).bat", // только имя, как в GUI-списке
 		Iface: "eth3",
 		GF:    "all",

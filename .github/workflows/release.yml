@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Тесты
+        run: |
+          go test ./...
+          cd gui && go test ./...
+
+      - name: Сборка CLI
+        run: go build -trimpath -ldflags "-s -w -H=windowsgui" -o f2n.exe .
+
+      - name: Сборка GUI
+        run: go build -trimpath -tags desktop,production -ldflags "-s -w -H=windowsgui" -o f2n-gui.exe .
+        working-directory: gui
+
+      - name: Упаковка
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item f2n-gui.exe dist/
+          Copy-Item f2n.exe dist/
+          Copy-Item F2N.ico dist/
+          Compress-Archive -Path dist/* -DestinationPath "f2n-${{ github.ref_name }}-windows-x64.zip" -Force
+          Get-ChildItem dist | ForEach-Object { Write-Output ("  " + $_.Name + "  " + $_.Length + " B") }
+
+      - name: Публикация релиза
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            f2n-*-windows-x64.zip
+            f2n-gui.exe
+            f2n.exe
+          generate_release_notes: true

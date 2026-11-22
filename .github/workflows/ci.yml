@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Тесты CLI (парсер, конвертер, goldens)
+        run: go test ./... -v
+
+      - name: Тесты GUI
+        run: go test ./... -v
+        working-directory: gui
+
+      - name: Сборка CLI
+        run: go build -trimpath -ldflags "-s -w -H=windowsgui" -o f2n.exe .
+
+      - name: Сборка GUI
+        run: go build -trimpath -tags desktop,production -ldflags "-s -w -H=windowsgui" -o f2n-gui.exe .
+        working-directory: gui

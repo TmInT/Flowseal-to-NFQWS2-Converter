@@ -204,10 +204,29 @@ func (a *App) DeployFromFolder(r Router, folder string, updateLists bool) ([]str
 	return a.deployKit(c, string(conf), adds, updateLists)
 }
 
+// emitProgress отправляет прогресс деплоя в фронтенд (Wails-событие).
+func (a *App) emitProgress(step, total int, msg string) {
+	if a.ctx == nil {
+		return
+	}
+	runtime.EventsEmit(a.ctx, "deploy:progress", map[string]interface{}{
+		"step": step, "total": total, "msg": msg,
+	})
+}
+
 // deployKit: бэкап → конфиг → списки (дополнение с бэкапами) → restart → статус.
 func (a *App) deployKit(c *sshctl.Client, conf string, adds map[string][]string, updateLists bool) ([]string, error) {
+	total := 5 // бэкап, конфиг, restart, статус + запас
+	if updateLists {
+		total += 4
+	}
+	step := 0
 	logs := []string{}
-	logf := func(s string) { logs = append(logs, s) }
+	logf := func(s string) {
+		logs = append(logs, s)
+		step++
+		a.emitProgress(step, total, s)
+	}
 
 	stamp := time.Now().Format("20060102-150405")
 	bak := "/opt/etc/nfqws2/nfqws2.conf.bak-f2n-" + stamp
@@ -268,6 +287,46 @@ func (a *App) ServiceAction(r Router, action string) (string, error) {
 // RouterLog — последние n строк лога автохостлиста.
 func (a *App) RouterLog(r Router, n int) (string, error) {
 	return a.sshClient(r).LogTail(n)
+}
+
+// validListName — белый список имён списков (защита от путей).
+var validListName = map[string]bool{
+	"user.list": true, "exclude.list": true, "auto.list": true,
+	"ipset.list": true, "ipset_exclude.list": true,
+}
+
+// LoadList читает список с роутера для редактора.
+func (a *App) LoadList(r Router, name string) (string, error) {
+	if !validListName[name] {
+		return "", fmt.Errorf("недопустимое имя списка: %s", name)
+	}
+	out, err := a.sshClient(r).ReadFile("/opt/etc/nfqws2/lists/" + name)
+	if err != nil {
+		return "", fmt.Errorf("список %s пуст или недоступен", name)
+	}
+	return out, nil
+}
+
+// SaveList сохраняет отредактированный список на роутер (с бэкапом и верификацией).
+// Возвращает имя созданного бэкапа.
+func (a *App) SaveList(r Router, name, content string) (string, error) {
+	if !validListName[name] {
+		return "", fmt.Errorf("недопустимое имя списка: %s", name)
+	}
+	c := a.sshClient(r)
+	stamp := time.Now().Format("20060102-150405")
+	bak := "/opt/etc/nfqws2/lists/" + name + ".bak-f2n-" + stamp
+	if _, err := c.Run("test -f /opt/etc/nfqws2/lists/" + name + " && cp /opt/etc/nfqws2/lists/" + name + " " + bak); err != nil {
+		return "", fmt.Errorf("бэкап списка: %w", err)
+	}
+	if err := c.WriteFile("/opt/etc/nfqws2/lists/"+name, content); err != nil {
+		return "", fmt.Errorf("запись списка: %w", err)
+	}
+	got, err := c.ReadFile("/opt/etc/nfqws2/lists/" + name)
+	if err != nil || strings.TrimRight(got, "\r\n") != strings.TrimRight(content, "\r\n") {
+		return "", fmt.Errorf("проверка записи не прошла — смотрите бэкап %s", bak)
+	}
+	return bak, nil
 }
 
 // SaveSettings сохраняет настройки интерфейса.
