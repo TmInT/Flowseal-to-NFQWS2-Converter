@@ -147,6 +147,9 @@ func (a *App) RouterCheck(r Router) (string, error) {
 	return out, nil
 }
 
+// Version возвращает версию инструмента (для футера GUI).
+func (a *App) Version() string { return convert.Version() }
+
 // exeDir возвращает каталог, где лежит .exe (туда же пишутся бэкапы и артефакты).
 func exeDir() string {
 	exe, err := os.Executable()
@@ -216,15 +219,24 @@ func (a *App) emitProgress(step, total int, msg string) {
 
 // deployKit: бэкап → конфиг → списки (дополнение с бэкапами) → restart → статус.
 func (a *App) deployKit(c *sshctl.Client, conf string, adds map[string][]string, updateLists bool) ([]string, error) {
-	total := 5 // бэкап, конфиг, restart, статус + запас
+	// Точный план шагов: бэкап, конфиг, списки (4 шт. либо «не изменялись»),
+	// restart, статус, iptables, готово.
+	total := 6
 	if updateLists {
 		total += 4
+	} else {
+		total++
 	}
 	step := 0
 	logs := []string{}
 	logf := func(s string) {
 		logs = append(logs, s)
 		step++
+		a.emitProgress(step, total, s)
+	}
+	// note — внеплановое сообщение (например, откат): в лог, но шаг не увеличивает.
+	note := func(s string) {
+		logs = append(logs, s)
 		a.emitProgress(step, total, s)
 	}
 
@@ -266,7 +278,7 @@ func (a *App) deployKit(c *sshctl.Client, conf string, adds map[string][]string,
 	out, err := c.Run("/opt/etc/init.d/S51nfqws2 restart")
 	logf("Restart: " + firstLine(out))
 	if err != nil {
-		logf("ОТКАТ: cp " + bak + " /opt/etc/nfqws2/nfqws2.conf и повторный restart")
+		note("ОТКАТ: cp " + bak + " /opt/etc/nfqws2/nfqws2.conf и повторный restart")
 		_, _ = c.Run("cp " + bak + " /opt/etc/nfqws2/nfqws2.conf && /opt/etc/init.d/S51nfqws2 restart")
 		return logs, fmt.Errorf("restart: %w", err)
 	}

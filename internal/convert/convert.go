@@ -31,7 +31,13 @@ type Result struct {
 	Infos     []string
 }
 
-const toolVersion = "f2n v0.1.0"
+// toolVersion — версия инструмента для заголовка конфига и REPORT.md.
+// В релизной сборке GitHub Actions подменяет её по git-тегу:
+// -ldflags "-X 'f2n/internal/convert.toolVersion=F2N v1.1.x'".
+var toolVersion = "F2N v1.1.2"
+
+// Version возвращает версию инструмента (для отображения в GUI).
+func Version() string { return toolVersion }
 
 type slotProf struct {
 	p      *flowseal.Profile

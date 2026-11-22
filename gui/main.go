@@ -16,7 +16,7 @@ func main() {
 	app := NewApp()
 
 	err := wails.Run(&options.App{
-		Title:     "f2n — Flowseal → NFQWS2 (Keenetic)",
+		Title:     "F2N — Flowseal → NFQWS2 (Keenetic)",
 		Width:     1020,
 		Height:    780,
 		MinWidth:  860,

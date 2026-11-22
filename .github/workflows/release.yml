@@ -24,10 +24,10 @@ jobs:
           cd gui && go test ./...
 
       - name: Сборка CLI
-        run: go build -trimpath -ldflags "-s -w -H=windowsgui" -o f2n.exe .
+        run: go build -trimpath -ldflags "-s -w -H=windowsgui -X 'f2n/internal/convert.toolVersion=F2N ${{ github.ref_name }}'" -o f2n.exe .
 
       - name: Сборка GUI
-        run: go build -trimpath -tags desktop,production -ldflags "-s -w -H=windowsgui" -o ..\f2n-gui.exe .
+        run: go build -trimpath -tags desktop,production -ldflags "-s -w -H=windowsgui -X 'f2n/internal/convert.toolVersion=F2N ${{ github.ref_name }}'" -o ..\f2n-gui.exe .
         working-directory: gui
 
       - name: Упаковка

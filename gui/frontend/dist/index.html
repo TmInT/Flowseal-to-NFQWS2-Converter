@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
-<title>f2n</title>
+<title>F2N</title>
 <style>
 :root {
   --bg: #181a20; --panel: #22252d; --panel2: #2a2e38; --line: #3a3f4b;
@@ -103,8 +103,8 @@ textarea {
         </div>
         <div class="row">
           <button onclick="svc('status')" title="S51nfqws2 status + количество правил в iptables">Статус</button>
-          <button onclick="svc('start')" title="S51nfqws2 start">Start</button>
-          <button onclick="svc('stop')" title="S51nfqws2 stop">Stop</button>
+          <button onclick="svc('start')" title="Запустить службу nfqws2 (S51nfqws2 start)">Запустить</button>
+          <button onclick="svc('stop')" title="Остановить службу nfqws2 (S51nfqws2 stop)">Остановить</button>
           <button onclick="doLog()" title="Последние 50 строк /opt/var/log/nfqws2.log (лог автохостлиста)">Лог автохостлиста</button>
         </div>
         <div class="check" style="margin-top:4px"><input type="checkbox" id="updlists" checked title="Дополнить списки строками из конвертации. Существующие строки не удаляются и не заменяются; перед изменением каждого списка создаётся его бэкап."><span>Обновлять списки (дополнение с бэкапом, без удаления ваших строк)</span></div>
@@ -153,7 +153,7 @@ textarea {
       <div id="progtext"></div>
       <div id="badges"></div>
       <textarea id="out" spellcheck="false" placeholder="Здесь появится конфиг и лог операций…"></textarea>
-      <div class="cardfooter">Developed by TmInT</div>
+      <div class="cardfooter"><span id="appver"></span>Developed by TmInT</div>
     </div>
   </div>
 </div>
@@ -249,6 +249,7 @@ function setProgress(step, total, msg) {
 }
 window.addEventListener("DOMContentLoaded", () => {
   try { window.runtime.EventsOn("deploy:progress", d => { setProgress(d.step, d.total, d.msg); log(d.msg); }); } catch (e) {}
+  try { window.go.main.App.Version().then(v => { if (v) $("appver").textContent = v + " · "; }); } catch (e) {}
   loadSettings();
 });
 async function doDeploy() {
@@ -290,11 +291,13 @@ async function doSaveList() {
     status("Список " + name + " сохранён. Бэкап: " + bak, "ok");
   } catch (e) { status("Ошибка: " + e, "err"); }
 }
+const svcLabels = { start: "Запуск", stop: "Остановка", restart: "Перезапуск", reload: "Перезагрузка", status: "Статус" };
 async function svc(action) {
   try {
     const out = await window.go.main.App.ServiceAction(router(), action);
-    status(action + ": " + (out || "OK").split("\n")[0], "ok");
-    log("[" + action + "] " + out);
+    const label = svcLabels[action] || action;
+    status(label + ": " + (out || "OK").split("\n")[0], "ok");
+    log("[" + label + "] " + out);
   } catch (e) { status("Ошибка: " + e, "err"); }
 }
 async function doLog() {

@@ -26,3 +26,5 @@ testdata/out-*/
 mgr.txt
 cj*.txt
 restore.ps1
+HANDOFF.md
+release-notes.md
