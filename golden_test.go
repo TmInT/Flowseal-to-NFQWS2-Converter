@@ -29,6 +29,8 @@ func TestGolden(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			// git на разных платформах может выгружать файлы с CRLF — нормализуем
+			normalize := func(b []byte) string { return strings.ReplaceAll(string(b), "\r\n", "\n") }
 			opts := convert.Options{
 				FlowsealDir: `testdata/flowseal`,
 				BatFile:     filepath.Join(`testdata/flowseal`, name+".bat"),
@@ -40,9 +42,9 @@ func TestGolden(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if res.Conf != string(want) {
-				wantLines := strings.Split(string(want), "\n")
-				gotLines := strings.Split(res.Conf, "\n")
+			if normalize(res.Conf) != normalize(want) {
+				wantLines := strings.Split(normalize(want), "\n")
+				gotLines := strings.Split(normalize(res.Conf), "\n")
 				for i := 0; i < len(wantLines) || i < len(gotLines); i++ {
 					var w, g string
 					if i < len(wantLines) {
