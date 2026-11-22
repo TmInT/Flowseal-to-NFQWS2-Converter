@@ -3,6 +3,10 @@
 Конвертер профилей [Flowseal/zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube)
 (winws `.bat`) в каноничный конфиг [nfqws2-keenetic](https://github.com/nfqws/nfqws2-keenetic).
 
+##Страница релиза
+
+[Последняя версия](https://github.com/TmInT/Flowseal-to-NFQWS2-Converter/releases/latest)
+
 ## Философия
 
 - **Списки остаются как задумано в NFQWS 2**: домены Flowseal сливаются в штатные
