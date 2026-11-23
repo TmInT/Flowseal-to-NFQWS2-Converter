@@ -56,3 +56,21 @@ go test ./...
 ```
 
 Тестовые фикстуры: `testdata/flowseal/` (пресеты и списки из репозитория Flowseal).
+
+## Краткий гайд по использованию
+
+1. Выберите путь к `zapret-discord-youtube`
+2. Выберите стратегию
+3. Нажмите на кнопку "Конвертировать"
+4. Введите свой пароль для доступа к Entware по SSH
+5. Нажмите на кнопку "Установить на роутер"
+
+<img width="1006" height="773" alt="F2N_Guide" src="https://github.com/user-attachments/assets/893ebddc-4b82-45bb-b863-4b26385f4f5e" />
+
+После нажатия на кнопку "Установить на роутер" будет контрольный вопрос
+
+<img width="1006" height="773" alt="F2N_Guide_2" src="https://github.com/user-attachments/assets/dc3b4a6a-ea31-4379-bce2-6c1ad78da1e2" />
+
+По завершению процесса будет выведен результат
+
+<img width="1006" height="773" alt="F2N_Guide_3" src="https://github.com/user-attachments/assets/4bd65142-0bcc-4949-8bdd-44f50ad077dc" />
