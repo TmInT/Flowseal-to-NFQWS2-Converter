@@ -10,9 +10,9 @@ import (
 
 // Fake is one --dpi-desync-fake-* source.
 type Fake struct {
-	Kind string // tls, http, quic, unknown, unknownudp, discord, stun
-	File string // path as written in the bat (flowseal-relative)
-	Mod  string // --dpi-desync-fake-tls-mod bound to this fake ("" = none)
+	Kind string // tls, http, quic, unknown, unknownudp, discord, stun, wireguard, dht
+	File string // path as written in the bat (flowseal-relative); "!" = winws built-in default
+	Mod  string // --dpi-desync-fake-tls-mod in effect for this fake ("" = none)
 }
 
 // Profile is one winws profile (args between --new separators).
@@ -34,16 +34,29 @@ type Profile struct {
 	Repeats                string
 	Fooling                []string
 	BadseqIncrement        string
+	BadackIncrement        string
 	Cutoff                 string
+	DesyncStart            string
 	AnyProtocol            bool
 	Fakes                  []Fake
+	TLSMod                 string // last --dpi-desync-fake-tls-mod seen in the profile
+	TLSModSet              bool   // the profile had --dpi-desync-fake-tls-mod at all
 	SplitPos               string
 	SeqOvl                 string
 	SeqOvlPattern          string
 	FakedsplitPattern      string
+	FakedsplitMod          string
 	HostfakesplitMod       string
+	HostfakesplitMidhost   string
 	IpID                   string
 	TsIncrement            string
+	Ttl, Ttl6              string
+	TCPFlagsSet            string
+	TCPFlagsUnset          string
+	IpfragPosTCP           string
+	IpfragPosUDP           string
+	UdplenIncrement        string
+	UdplenPattern          string
 	GamePorts              bool // ports referenced %GameFilter%
 	Unknown                []string
 }
@@ -57,13 +70,15 @@ type Parsed struct {
 }
 
 var fakeArgKind = map[string]string{
-	"dpi-desync-fake-tls":          "tls",
-	"dpi-desync-fake-http":         "http",
-	"dpi-desync-fake-quic":         "quic",
-	"dpi-desync-fake-unknown":      "unknown",
-	"dpi-desync-fake-unknown-udp":  "unknownudp",
-	"dpi-desync-fake-discord":      "discord",
-	"dpi-desync-fake-stun":         "stun",
+	"dpi-desync-fake-tls":         "tls",
+	"dpi-desync-fake-http":        "http",
+	"dpi-desync-fake-quic":        "quic",
+	"dpi-desync-fake-unknown":     "unknown",
+	"dpi-desync-fake-unknown-udp": "unknownudp",
+	"dpi-desync-fake-discord":     "discord",
+	"dpi-desync-fake-stun":        "stun",
+	"dpi-desync-fake-wireguard":   "wireguard",
+	"dpi-desync-fake-dht":         "dht",
 }
 
 func ParseBat(path string, gameTCP, gameUDP string) (*Parsed, error) {
@@ -149,16 +164,18 @@ func ParseBat(path string, gameTCP, gameUDP string) (*Parsed, error) {
 func parseProfile(toks []string, gameTCP, gameUDP string) *Profile {
 	pr := &Profile{}
 	hasDesync := false
-	pendingTLSMod := ""
-	bindTLSMod := func(val string) {
-		// bind to the nearest preceding tls fake; if none yet, keep pending for the next one
+	// winws: a fake takes the tls-mod that is in effect at its definition;
+	// a later --dpi-desync-fake-tls-mod overrides the mod of the last TLS fake
+	curTLSMod := ""
+	setTLSMod := func(val string) {
+		curTLSMod = val
+		pr.TLSMod, pr.TLSModSet = val, true
 		for i := len(pr.Fakes) - 1; i >= 0; i-- {
 			if pr.Fakes[i].Kind == "tls" {
 				pr.Fakes[i].Mod = val
-				return
+				break
 			}
 		}
-		pendingTLSMod = val
 	}
 	for _, tok := range toks {
 		isGame := strings.Contains(tok, "%GameFilter")
@@ -211,8 +228,14 @@ func parseProfile(toks []string, gameTCP, gameUDP string) *Profile {
 			pr.Fooling = append(pr.Fooling, splitList(val)...)
 		case "dpi-desync-cutoff":
 			pr.Cutoff = val
+		case "dpi-desync-start":
+			pr.DesyncStart = val
 		case "dpi-desync-ts-increment":
 			pr.TsIncrement = val
+		case "dpi-desync-badseq-increment":
+			pr.BadseqIncrement = val
+		case "dpi-desync-badack-increment":
+			pr.BadackIncrement = val
 		case "dpi-desync-split-pos":
 			pr.SplitPos = val
 		case "dpi-desync-split-seqovl":
@@ -224,19 +247,36 @@ func parseProfile(toks []string, gameTCP, gameUDP string) *Profile {
 		case "ip-id":
 			pr.IpID = val
 		case "dpi-desync-fake-tls-mod":
-			bindTLSMod(val)
+			setTLSMod(val)
 		case "dpi-desync-hostfakesplit-mod":
 			pr.HostfakesplitMod = val
-		case "dpi-desync-badseq-increment":
-			pr.BadseqIncrement = val
+		case "dpi-desync-hostfakesplit-midhost":
+			pr.HostfakesplitMidhost = val
 		case "dpi-desync-fakedsplit-pattern":
 			pr.FakedsplitPattern = val
+		case "dpi-desync-fakedsplit-mod":
+			pr.FakedsplitMod = val
+		case "dpi-desync-ttl":
+			pr.Ttl = val
+		case "dpi-desync-ttl6":
+			pr.Ttl6 = val
+		case "dpi-desync-tcp-flags-set":
+			pr.TCPFlagsSet = val
+		case "dpi-desync-tcp-flags-unset":
+			pr.TCPFlagsUnset = val
+		case "dpi-desync-ipfrag-pos-tcp":
+			pr.IpfragPosTCP = val
+		case "dpi-desync-ipfrag-pos-udp":
+			pr.IpfragPosUDP = val
+		case "dpi-desync-udplen-increment":
+			pr.UdplenIncrement = val
+		case "dpi-desync-udplen-pattern":
+			pr.UdplenPattern = val
 		default:
 			if kind, ok := fakeArgKind[name]; ok {
-				f := Fake{Kind: kind, File: val}
-				if kind == "tls" && pendingTLSMod != "" {
-					f.Mod = pendingTLSMod
-					pendingTLSMod = ""
+				f := Fake{Kind: kind, File: normalizeFakeRef(val)}
+				if kind == "tls" {
+					f.Mod = curTLSMod
 				}
 				pr.Fakes = append(pr.Fakes, f)
 				hasDesync = true
@@ -249,6 +289,22 @@ func parseProfile(toks []string, gameTCP, gameUDP string) *Profile {
 		return nil
 	}
 	return pr
+}
+
+// normalizeFakeRef turns the batch-escaped winws fake reference into a plain one:
+// "^!" → "!", "@file" → "file", "!+ofs" → "!" (offsets are not used by Flowseal).
+func normalizeFakeRef(val string) string {
+	if val == "" {
+		return ""
+	}
+	val = strings.TrimPrefix(val, "^") // бат-экранирование: "^!" → "!"
+	if val == "" {
+		return ""
+	}
+	if val[0] == '!' {
+		return "!"
+	}
+	return strings.TrimPrefix(val, "@")
 }
 
 func expandVars(tok, gameTCP, gameUDP string) string {
@@ -323,9 +379,6 @@ func tokenize(s string) []string {
 	}
 	if t := cur.String(); t != "" && t != "^" {
 		toks = append(toks, t)
-	}
-	if cur.Len() > 0 {
-		toks = append(toks, cur.String())
 	}
 	return toks
 }

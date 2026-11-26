@@ -60,7 +60,17 @@ func (a *App) toOpts(o ConvertOpts, outDir string) convert.Options {
 	}
 }
 
+// strictFail — строгий режим: любое предупреждение конвертации считается ошибкой.
+func strictFail(strict bool, res *convert.Result) error {
+	if strict && len(res.Warnings) > 0 {
+		return fmt.Errorf("строгий режим: предупреждений конвертации — %d: %s", len(res.Warnings), strings.Join(res.Warnings, "; "))
+	}
+	return nil
+}
+
 // ListBats возвращает список .bat-профилей в папке Flowseal.
+// service*.bat — менеджер службы, в нём стратегий обхода нет (Flowseal в своём
+// меню установки исключает его так же).
 func (a *App) ListBats(dir string) ([]string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -68,7 +78,8 @@ func (a *App) ListBats(dir string) ([]string, error) {
 	}
 	var out []string
 	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".bat") {
+		name := strings.ToLower(e.Name())
+		if !e.IsDir() && strings.HasSuffix(name, ".bat") && !strings.HasPrefix(name, "service") {
 			out = append(out, e.Name())
 		}
 	}
@@ -87,6 +98,9 @@ func (a *App) PickFolder() (string, error) {
 func (a *App) Preview(o ConvertOpts) (*ConvertResult, error) {
 	res, err := convert.Run(a.toOpts(o, "converted"))
 	if err != nil {
+		return nil, err
+	}
+	if err := strictFail(o.Strict, res); err != nil {
 		return nil, err
 	}
 	return &ConvertResult{
@@ -112,6 +126,9 @@ func (a *App) ExportLocal(o ConvertOpts) (*ExportResult, error) {
 	outDir := filepath.Join(filepath.Dir(exe), "converted")
 	res, err := convert.Run(a.toOpts(o, outDir))
 	if err != nil {
+		return nil, err
+	}
+	if err := strictFail(o.Strict, res); err != nil {
 		return nil, err
 	}
 	files, err := convert.WriteOutputs(a.toOpts(o, outDir), res)
@@ -165,6 +182,9 @@ func (a *App) DeploySSH(o ConvertOpts, r Router, updateLists bool) ([]string, er
 	outDir := filepath.Join(exeDir(), "last-deploy")
 	res, err := convert.Run(a.toOpts(o, outDir))
 	if err != nil {
+		return nil, err
+	}
+	if err := strictFail(o.Strict, res); err != nil {
 		return nil, err
 	}
 	if _, err := convert.WriteOutputs(a.toOpts(o, outDir), res); err != nil {

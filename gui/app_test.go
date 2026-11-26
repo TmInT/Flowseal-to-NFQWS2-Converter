@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -23,5 +25,23 @@ func TestPreviewResolvesBatFilename(t *testing.T) {
 	}
 	if !strings.Contains(res.Conf, "active_discord_udp") {
 		t.Fatalf("конфиг без активного discord-фейка")
+	}
+}
+
+// TestListBatsSkipsService — service*.bat в списке стратегий показываться
+// не должен: это менеджер службы, а не стратегия обхода.
+func TestListBatsSkipsService(t *testing.T) {
+	dir := t.TempDir()
+	for _, n := range []string{"service.bat", "general.bat", "general (ALT11).bat", "SERVICE.BAT"} {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("@echo off\r\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := NewApp().ListBats(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, "|") != "general (ALT11).bat|general.bat" {
+		t.Errorf("ListBats = %v", got)
 	}
 }

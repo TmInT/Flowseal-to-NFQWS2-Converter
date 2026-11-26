@@ -34,14 +34,14 @@ type Result struct {
 // toolVersion — версия инструмента для заголовка конфига и REPORT.md.
 // В релизной сборке GitHub Actions подменяет её по git-тегу:
 // -ldflags "-X 'f2n/internal/convert.toolVersion=F2N v1.1.x'".
-var toolVersion = "F2N v1.1.2"
+var toolVersion = "F2N v1.2.0"
 
 // Version возвращает версию инструмента (для отображения в GUI).
 func Version() string { return toolVersion }
 
 type slotProf struct {
 	p      *flowseal.Profile
-	mapped profArgs
+	mapped mapped
 	kind   string
 }
 
@@ -90,15 +90,19 @@ func Run(opts Options) (*Result, error) {
 
 	// ---- pass 1: structural classification (no mapping yet) ----
 	var quicMain, tcpMain, udpMain *slotProf
+	hasL7 := func(list []string, proto string) bool {
+		return hasPort(list, proto)
+	}
 	for i := range slots {
 		sp := &slots[i]
 		p := sp.p
+		isQuicShape := (hasPort(p.FilterUDP, "443") || (hasL7(p.FilterL7, "quic") && len(p.FilterUDP) == 0)) && hasDomainList(p)
 		switch {
 		case p.GamePorts && opts.GameFilter == "disabled":
 			sp.kind = "dropped"
 		case isIpset(p) && !hasDomainList(p):
 			sp.kind = "ipset-cand"
-		case hasPort(p.FilterUDP, "443") && hasDomainList(p):
+		case isQuicShape:
 			sp.kind = "quic-main"
 			quicMain = sp // last wins
 		case hasPort(p.FilterTCP, "443") && hasDomainList(p):
@@ -117,33 +121,52 @@ func Run(opts Options) (*Result, error) {
 	}
 
 	// ---- pass 2: demote non-last mains ----
+	// Это не потеря: профиль уходит в CUSTOM с инлайн-доменами и стоит в строю
+	// раньше главного, то есть выбирается так же, как в winws.
 	for i := range slots {
 		sp := &slots[i]
 		switch sp.kind {
 		case "quic-main":
 			if sp != quicMain {
 				sp.kind = "custom"
-				res.Warnings = append(res.Warnings, fmt.Sprintf("профиль %d: несколько общих QUIC-профилей — не последний перенесён в CUSTOM", sp.p.Index))
+				res.Infos = append(res.Infos, fmt.Sprintf("профиль %d: несколько общих QUIC-профилей — не последний перенесён в CUSTOM с инлайн-доменами", sp.p.Index))
 			}
 		case "tcp-main":
 			if sp != tcpMain {
 				sp.kind = "custom"
-				res.Warnings = append(res.Warnings, fmt.Sprintf("профиль %d: несколько общих TCP-профилей — не последний перенесён в CUSTOM с инлайн-доменами", sp.p.Index))
+				res.Infos = append(res.Infos, fmt.Sprintf("профиль %d: отдельный список доменов (например list-google) — перенесён в CUSTOM с инлайн-доменами", sp.p.Index))
 			}
 		}
 	}
 
 	// ---- pass 3: map surviving profiles (blobs only for them) ----
 	blobs := newBlobStore(filepath.Join(opts.FlowsealDir, "bin"))
+	var inits []string
+	seenInit := map[string]bool{}
+	altorder := false
 	for i := range slots {
 		sp := &slots[i]
 		if sp.kind == "dropped" {
 			continue
 		}
-		m, w := mapProfile(sp.p, blobs)
-		for _, x := range w {
+		m := mapProfile(sp.p, blobs)
+		for _, x := range m.warns {
 			res.Warnings = append(res.Warnings, fmt.Sprintf("профиль %d: %s", sp.p.Index, x))
 		}
+		for _, x := range m.infos {
+			res.Infos = append(res.Infos, fmt.Sprintf("профиль %d: %s", sp.p.Index, x))
+		}
+		// параметры, которых парсер не знает, молча терять нельзя
+		for _, u := range sp.p.Unknown {
+			res.Warnings = append(res.Warnings, fmt.Sprintf("профиль %d: параметр %s не поддерживается конвертером — пропущен", sp.p.Index, u))
+		}
+		for _, in := range m.inits {
+			if !seenInit[in] {
+				seenInit[in] = true
+				inits = append(inits, in)
+			}
+		}
+		altorder = altorder || m.alt
 		sp.mapped = m
 	}
 	// ---- pass 4: fold ipset candidates whose strategy equals a main slot ----
@@ -177,7 +200,7 @@ func Run(opts Options) (*Result, error) {
 	}
 
 	if tcpMain == nil {
-		res.Warnings = append(res.Warnings, "в пресете нет общего TCP-профиля — NFQWS_ARGS пуст, спискам MODE_AUTO не к чему применяться")
+		res.Infos = append(res.Infos, "в пресете нет общего TCP-профиля со списком доменов — NFQWS_ARGS пуст, TCP обрабатывают профили CUSTOM")
 	}
 	if quicMain == nil {
 		res.Infos = append(res.Infos, "в пресете нет общего QUIC-профиля — NFQWS_ARGS_QUIC пуст")
@@ -193,6 +216,9 @@ func Run(opts Options) (*Result, error) {
 		}
 		if len(p.FilterL7) > 0 {
 			out = append(out, "--filter-l7="+strings.Join(p.FilterL7, ","))
+		}
+		if p.FilterL3 != "" {
+			out = append(out, "--filter-l3="+p.FilterL3)
 		}
 		return out
 	}
@@ -249,12 +275,15 @@ func Run(opts Options) (*Result, error) {
 		"--lua-init=@/opt/etc/nfqws2/lua/zapret-antidpi.lua")
 	// блобы инлайнятся hex'ом: конфиг самодостаточен и деплоится целиком
 	// через файловый API веб-морды (blobs/ на роутере не требуются)
-	for _, name := range blobs.order {
-		data, err := os.ReadFile(blobs.files[name])
-		if err != nil {
-			return nil, fmt.Errorf("blob %s: %w", name, err)
-		}
-		base = append(base, fmt.Sprintf("--blob=%s:0x%x", name, data))
+	for _, bl := range blobs.inline() {
+		base = append(base, bl)
+	}
+	// функции, которых нет в штатных библиотеках, встраиваются lua-кодом
+	if altorder {
+		base = append(base, "--lua-init="+altorderInit)
+	}
+	for _, in := range inits {
+		base = append(base, "--lua-init="+in)
 	}
 	fmt.Fprintf(&conf, "NFQWS_BASE_ARGS=\"%s\"\n", indentLines(strings.Join(base, "\n")))
 

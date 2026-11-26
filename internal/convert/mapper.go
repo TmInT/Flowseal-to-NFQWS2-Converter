@@ -1,15 +1,32 @@
 package convert
 
 import (
+	_ "embed"
+	"encoding/hex"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"f2n/internal/flowseal"
 )
 
-// fakePayload maps winws fake-source kind to nfqws2 payload name.
+//go:embed altorder.lua
+var altorderLuaRaw string
+
+// altorderLua — исходник с нормализованными переводами строк. Он уходит в конфиг
+// hex'ом, поэтому байты не должны зависеть от того, с какими переводами строк
+// файл выгрузил git (на CI под Windows это CRLF).
+var altorderLua = strings.ReplaceAll(altorderLuaRaw, "\r\n", "\n")
+
+// altorderInit — lua-код функции altorder, встроенный в конфиг одной строкой.
+// Шелл init-скрипта делит аргументы по пробелам, поэтому исходник передаётся hex-строкой.
+// loadstring есть и в LuaJIT (сборки nfqws2), и в обычной Lua 5.1.
+var altorderInit = "assert(loadstring(parse_hex('" + hex.EncodeToString([]byte(altorderLua)) + "')))()"
+
+// fakePayload maps winws fake-source kind to nfqws2 payload name(s).
 var fakePayload = map[string]string{
 	"tls":        "tls_client_hello",
 	"http":       "http_req",
@@ -18,18 +35,53 @@ var fakePayload = map[string]string{
 	"unknownudp": "unknown",
 	"discord":    "discord_ip_discovery",
 	"stun":       "stun",
+	"wireguard":  "wireguard_initiation,wireguard_response,wireguard_cookie,wireguard_keepalive",
+	"dht":        "dht",
 }
 
-// blobStore collects and names blobs from the Flowseal folder.
+// l7ToKind maps --filter-l7 values to fake kinds.
+var l7ToKind = map[string]string{
+	"http": "http", "tls": "tls", "quic": "quic", "discord": "discord",
+	"stun": "stun", "wireguard": "wireguard", "dht": "dht",
+}
+
+func zeroBlob(n int) func() []byte { return func() []byte { return make([]byte, n) } }
+
+// defaultFake — что winws подставляет для протокола, если свой фейк не задан.
+var defaultFake = map[string]struct {
+	name string
+	data func() []byte
+}{
+	"tls":        {"f2n_fake_tls", fakeTLSDefault},
+	"http":       {"f2n_fake_http", func() []byte { return []byte(fakeHTTPDefault) }},
+	"quic":       {"f2n_fake_quic", fakeQUICDefault},
+	"unknown":    {"f2n_fake_z256", zeroBlob(256)},
+	"unknownudp": {"f2n_fake_z64", zeroBlob(64)},
+	"discord":    {"f2n_fake_z64", zeroBlob(64)},
+	"stun":       {"f2n_fake_z64", zeroBlob(64)},
+	"wireguard":  {"f2n_fake_z64", zeroBlob(64)},
+	"dht":        {"f2n_fake_z64", zeroBlob(64)},
+}
+
+// blobStore collects the blobs of a conversion: files from the Flowseal folder and
+// built-in fakes. All of them are inlined as hex — the config stays self-sufficient.
 type blobStore struct {
 	dir   string
 	names map[string]string // source abs path -> blob name
-	order []string
-	files map[string]string // blob name -> source abs path
+	blobs map[string][]byte // blob name -> inline data
+	order []string          // blob name, in first-use order
 }
 
 func newBlobStore(binDir string) *blobStore {
-	return &blobStore{dir: binDir, names: map[string]string{}, files: map[string]string{}}
+	return &blobStore{dir: binDir, names: map[string]string{}, blobs: map[string][]byte{}}
+}
+
+func (b *blobStore) add(name string, data []byte) {
+	if _, ok := b.blobs[name]; ok {
+		return
+	}
+	b.blobs[name] = data
+	b.order = append(b.order, name)
 }
 
 // blobName resolves a flowseal fake file path to a blob name; registers it if new.
@@ -56,243 +108,561 @@ func (b *blobStore) blobName(file string) (string, error) {
 	if n, ok := b.names[abs]; ok {
 		return n, nil
 	}
-	base := strings.ToLower(strings.TrimSuffix(filepath.Base(src), filepath.Ext(src)))
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		return "", fmt.Errorf("blob %s: %w", file, err)
+	}
+	base := strings.ToLower(strings.TrimSuffix(filepath.Base(abs), filepath.Ext(abs)))
 	for i := 2; ; i++ {
-		if _, exists := b.files[base]; !exists {
+		if _, exists := b.blobs[base]; !exists {
 			break
 		}
 		base = fmt.Sprintf("%s_%d", base, i)
 	}
 	b.names[abs] = base
-	b.files[base] = abs
-	b.order = append(b.order, base)
+	b.add(base, data)
 	return base, nil
 }
 
-// profArgs accumulates nfqws2 args for one profile.
-type profArgs struct {
-	args []string
-	core []string // strategy args without filter/list args (for ipset folding)
+// inline returns the --blob lines for NFQWS_BASE_ARGS.
+func (b *blobStore) inline() []string {
+	out := make([]string, 0, len(b.order))
+	for _, name := range b.order {
+		out = append(out, fmt.Sprintf("--blob=%s:0x%s", name, hex.EncodeToString(b.blobs[name])))
+	}
+	return out
 }
 
-func (a *profArgs) block(payload, lua string) {
-	a.args = append(a.args, "--payload="+payload, "--lua-desync="+lua)
-	a.core = append(a.core, lua)
+// mapped is the nfqws2 form of one winws profile.
+type mapped struct {
+	args  []string // --out-range, then --payload + --lua-desync per instance, in order
+	core  []string // instance signatures "payload|fn:args" (ipset folding compares them)
+	inits []string // --lua-init lines the instances depend on
+	alt   bool     // uses the embedded altorder function
+	warns []string
+	infos []string
 }
+
+type warnFunc func(format string, a ...interface{})
 
 // mapProfile converts one winws profile into nfqws2 args.
-func mapProfile(p *flowseal.Profile, blobs *blobStore) (out profArgs, warns []string) {
-	tsVal := func() string {
-		if p.TsIncrement != "" {
-			return p.TsIncrement
-		}
-		return "-600000" // convention used by working nfqws2 configs
+//
+// Правила соответствия (сверены с исходниками zapret1 и Lua-библиотек zapret2):
+//   - fooling в winws искажает только фейки; реальные сегменты уходят как есть.
+//     В nfqws2 fooling-аргументы применяются ко всему, что отправляет функция,
+//     поэтому multisplit/multidisorder их не получают.
+//   - позиция разреза: winws задаёт длину первой части (1 = сразу после первого байта),
+//     nfqws2 — начало следующей части, поэтому числовые позиции сдвигаются на 1.
+//     Маркеры (midsld, host...) в обеих системах указывают на один и тот же байт.
+//   - --dpi-desync-cutoff действует на весь профиль, а --out-range в nfqws2 только
+//     на последующие инстансы — поэтому он идёт первым.
+//   - фейки: winws отправляет все фейки протокола по очереди, каждый repeats раз;
+//     если своего фейка нет — встроенный.
+func mapProfile(p *flowseal.Profile, b *blobStore) mapped {
+	m := mapped{}
+	warnf := func(format string, a ...interface{}) { m.warns = append(m.warns, fmt.Sprintf(format, a...)) }
+
+	fooling := foolingArgs(p, warnf)
+	ipid := ipIDArgs(p, warnf)
+	var repeats []string
+	if p.Repeats != "" {
+		repeats = []string{"repeats=" + p.Repeats}
+	}
+	// any-protocol: "по всем непустым пакетам данных"
+	anyf, base := "", "known"
+	if p.AnyProtocol {
+		anyf, base = "payload=~empty", "all"
 	}
 
-	luaJoin := func(base string, parts ...string) string {
-		out := []string{base}
-		for _, x := range parts {
-			if x != "" {
-				out = append(out, x)
-			}
-		}
-		return strings.Join(out, ":")
+	if r := rangeArg(p, warnf); r != "" {
+		m.args = append(m.args, "--out-range="+r)
 	}
 
-	foolingParts := func() (out []string) {
-		for _, f := range p.Fooling {
-			switch f {
-			case "ts":
-				out = append(out, "tcp_ts="+tsVal())
-			case "badseq":
-				if p.BadseqIncrement != "" {
-					out = append(out, "tcp_seq="+p.BadseqIncrement)
-				} else {
-					out = append(out, "tcp_seq=-10000", "tcp_ack=-66000")
-				}
-			case "md5sig":
-				out = append(out, "tcp_md5")
-			case "badsum":
-				out = append(out, "badsum")
-			default:
-				warns = append(warns, fmt.Sprintf("fooling=%s не имеет прямого аналога в nfqws2 — пропущен", f))
+	emit := func(payload, fn string, arg ...string) {
+		sig := luaJoin(fn, arg...)
+		m.args = append(m.args, "--payload="+payload, "--lua-desync="+sig)
+		m.core = append(m.core, payload+"|"+sig)
+	}
+
+	ref := func(file string) (string, bool) {
+		if _, ok := b.blobs[file]; ok {
+			return file, true // встроенный фейк, уже зарегистрирован
+		}
+		if strings.HasPrefix(file, "0x") {
+			return file, true // inline hex blob, nfqws2 понимает напрямую
+		}
+		n, err := b.blobName(file)
+		if err != nil {
+			warnf("%s — использован blob=0x00000000", err)
+			return "0x00000000", false
+		}
+		return n, true
+	}
+	// blobArg: "name=<blob>" для файла или hex-строки
+	blobArg := func(name, file string) []string {
+		if file == "" {
+			return nil
+		}
+		n, ok := ref(file)
+		if !ok {
+			return nil
+		}
+		return []string{name + "=" + n}
+	}
+
+	// tlsRef: blob для TLS-фейка. Однократные моды (rndsni, sni=) winws применяет
+	// при старте — здесь они выполняются в --lua-init; остальные уходят в tls_mod.
+	tlsRef := func(f flowseal.Fake) (string, string) {
+		name, ok := ref(f.File)
+		if f.Kind != "tls" {
+			return name, ""
+		}
+		one, rt := splitTLSMod(f.Mod, warnf)
+		if one == "" || !ok {
+			return name, rt
+		}
+		if strings.HasPrefix(name, "0x") {
+			raw, _ := hex.DecodeString(strings.TrimPrefix(name, "0x"))
+			name = fmt.Sprintf("f2n_hex_%d", len(b.order)+1)
+			b.add(name, raw)
+		}
+		// имя детерминированное: одинаковые моды разных профилей дают одну и ту же строку init
+		h := fnv.New32a()
+		h.Write([]byte(name + "|" + one))
+		derived := fmt.Sprintf("f2n_tls_%08x", h.Sum32())
+		m.inits = append(m.inits, derived+"=tls_mod("+name+",'"+one+"')")
+		return derived, rt
+	}
+
+	fakesOf := func(kind string) []flowseal.Fake {
+		var out []flowseal.Fake
+		for _, f := range p.Fakes {
+			if f.Kind == kind {
+				out = append(out, f)
 			}
 		}
 		return out
 	}
-	ipID := func() string {
-		if p.IpID == "zero" {
-			return "ip_id=zero"
-		}
-		return ""
-	}
-	repeats := func() string {
-		if p.Repeats == "" {
-			return ""
-		}
-		return "repeats=" + p.Repeats
-	}
-	pos := func() string {
-		if p.SplitPos == "" {
-			return ""
-		}
-		return "pos=" + p.SplitPos
-	}
-	seqovl := func() string {
-		if p.SeqOvl == "" {
-			return ""
-		}
-		return "seqovl=" + p.SeqOvl
-	}
-	payloadUnion := func() string {
-		if p.AnyProtocol {
-			return "all"
-		}
-		seen := map[string]bool{}
-		var out []string
-		for _, f := range p.Fakes {
-			n := fakePayload[f.Kind]
-			if !seen[n] {
-				seen[n] = true
-				out = append(out, n)
-			}
-		}
-		if len(out) == 0 {
-			warns = append(warns, "у профиля нет fake-файлов — payload по умолчанию tls_client_hello")
-			out = []string{"tls_client_hello"}
-		}
-		return strings.Join(out, ",")
-	}
-	blob := func(file string) string {
-		if file == "!" || file == "^!" {
-			warns = append(warns, "fake-источник \"!\" (заглушка Flowseal) — пропущен")
-			return ""
-		}
-		if strings.HasPrefix(file, "0x") {
-			return file // inline hex blob, nfqws2 понимает напрямую
-		}
-		n, err := blobs.blobName(file)
-		if err != nil {
-			warns = append(warns, err.Error()+" — использован blob=0x00000000")
-			return "0x00000000"
-		}
-		return n
-	}
-	pattern := func(file string) string {
-		if file == "" {
-			return ""
-		}
-		n, err := blobs.blobName(file)
-		if err != nil {
-			warns = append(warns, "seqovl_pattern: "+err.Error()+" — параметр опущен")
-			return ""
-		}
-		return "seqovl_pattern=" + n
-	}
-	// patternOrHex: nfqws1 разрешает паттерн как файл, так и 0x-hex
-	patternOrHex := func(file, hex string) string {
-		if hex != "" {
-			if strings.HasPrefix(hex, "0x") {
-				return "seqovl_pattern=" + hex
-			}
-			warns = append(warns, "pattern="+hex+" — не 0x-hex и не файл, пропущен")
-			return ""
-		}
-		return pattern(file)
+	kinds := visibleKinds(p)
+
+	// без своего TLS-фейка winws берёт встроенный с модами по умолчанию (rnd,rndsni,dupsid)
+	// или с последним --dpi-desync-fake-tls-mod профиля
+	defaultTLSMod := "rnd,rndsni,dupsid"
+	if p.TLSModSet {
+		defaultTLSMod = p.TLSMod
 	}
 
-	fakeArgs := func(blobName, tlsMod string) string {
-		parts := []string{"fake:blob=" + blobName}
-		if r := repeats(); r != "" {
-			parts = append(parts, r)
+	emitFakes := func(knownOnly bool) {
+		for _, k := range kinds {
+			if knownOnly && (k == "unknown" || k == "unknownudp") {
+				continue
+			}
+			defs := fakesOf(k)
+			if len(defs) == 0 {
+				defs = []flowseal.Fake{{Kind: k, File: defaultFake[k].name, Mod: defaultTLSMod}}
+			}
+			for _, f := range defs {
+				if f.File == "!" {
+					f.File = defaultFake[k].name // "!" = встроенный ClientHello winws
+				}
+				if f.File == defaultFake[k].name {
+					b.add(defaultFake[k].name, defaultFake[k].data())
+				}
+				name, rt := tlsRef(f)
+				arg := []string{"blob=" + name}
+				if rt != "" {
+					arg = append(arg, "tls_mod="+rt)
+				}
+				arg = cat(arg, repeats, fooling, ipid)
+				emit(fakePayload[k], "fake", arg...)
+			}
 		}
-		if tlsMod != "" && tlsMod != "none" {
-			parts = append(parts, "tls_mod="+tlsMod)
+	}
+
+	seqovl := func(markers bool) []string {
+		if p.SeqOvl == "" {
+			return nil
 		}
-		parts = append(parts, foolingParts()...)
-		if v := ipID(); v != "" {
-			parts = append(parts, v)
+		if markers || isDigits(p.SeqOvl) {
+			return []string{"seqovl=" + p.SeqOvl}
 		}
-		return strings.Join(parts, ":")
+		warnf("split-seqovl=%s: для этого режима winws допускает только число — пропущен", p.SeqOvl)
+		return nil
+	}
+
+	faked := func(fn string) {
+		arg := []string{}
+		if pos, approx := fakedPos(p.SplitPos); pos != "" {
+			arg = append(arg, "pos="+pos)
+			if approx {
+				warnf("список позиций разреза свёрнут к одной (%s) — winws выбирал первую подходящую", pos)
+			}
+		}
+		arg = append(arg, seqovl(fn == "fakeddisorder")...)
+		arg = append(arg, blobArg("seqovl_pattern", p.SeqOvlPattern)...)
+		arg = append(arg, blobArg("pattern", p.FakedsplitPattern)...)
+		arg = append(arg, fakedsplitAlt(p.FakedsplitMod, warnf)...)
+		arg = cat(arg, fooling, []string{"tcp_ts_up"}, ipid, repeats, []string{anyf})
+		emit(base, fn, arg...)
 	}
 
 	for _, mode := range p.Desync {
 		switch mode {
-		case "fake":
-			if len(p.Fakes) == 0 {
-				warns = append(warns, "mode=fake без fake-файлов — использован blob=0x00000000")
-				out.block("unknown", fakeArgs("0x00000000", ""))
-				continue
-			}
-			for _, f := range p.Fakes {
-				bn := blob(f.File)
-				if bn == "" {
-					continue
-				}
-				out.block(fakePayload[f.Kind], fakeArgs(bn, f.Mod))
-			}
 		case "syndata":
-			// zapret2: нативная lua-функция syndata (нулевая фаза, SYN с payload)
-			out.block(payloadUnion(), luaJoin("syndata", foolingParts()...))
-			warns = append(warns, "syndata — нулевая фаза; в nfqws2 работает с хостлистами только в режиме --ipcache-hostname")
-		case "multisplit", "split2", "split":
-			if mode != "multisplit" {
-				warns = append(warns, fmt.Sprintf("mode=%s заменён на multisplit (nfqws2-эквивалент)", mode))
+			// SYN — пустой пакет: фильтр payload не должен его отсекать
+			emit("all", "syndata", cat(fooling, ipid)...)
+		case "fake", "fakeknown":
+			emitFakes(mode == "fakeknown")
+		case "rst", "rstack":
+			arg := cat(fooling, ipid, []string{anyf})
+			if mode == "rstack" {
+				arg = append(arg, "rstack")
 			}
-			out.block(payloadUnion(), luaJoin("multisplit", pos(), seqovl(), pattern(p.SeqOvlPattern), ipID()))
-		case "disorder", "disorder2", "multidisorder":
-			if mode != "multidisorder" {
-				warns = append(warns, fmt.Sprintf("mode=%s заменён на multidisorder", mode))
+			emit(base, "rst", arg...)
+		case "multisplit", "split2":
+			arg := []string{}
+			if pos := convPos(p.SplitPos); pos != "" {
+				arg = append(arg, "pos="+pos)
 			}
-			out.block(payloadUnion(), luaJoin("multidisorder", pos()))
-		case "fakedsplit":
-			out.block(payloadUnion(), luaJoin("fakedsplit",
-				pos(), seqovl(), patternOrHex(p.SeqOvlPattern, p.FakedsplitPattern), "tcp_seq=-10000", ipID()))
-		case "fakeddisorder":
-			out.block(payloadUnion(), luaJoin("fakeddisorder",
-				pos(), patternOrHex(p.SeqOvlPattern, p.FakedsplitPattern), "tcp_seq=-10000", ipID()))
+			arg = append(arg, seqovl(false)...)
+			arg = append(arg, blobArg("seqovl_pattern", p.SeqOvlPattern)...)
+			arg = cat(arg, ipid, []string{anyf})
+			emit(base, "multisplit", arg...)
+		case "multidisorder", "disorder2":
+			arg := []string{}
+			if pos := convPos(p.SplitPos); pos != "" {
+				arg = append(arg, "pos="+pos)
+			}
+			arg = append(arg, seqovl(true)...)
+			arg = append(arg, blobArg("seqovl_pattern", p.SeqOvlPattern)...)
+			arg = cat(arg, ipid, []string{anyf})
+			emit(base, "multidisorder", arg...)
+		case "split", "fakedsplit":
+			faked("fakedsplit")
+		case "disorder", "fakeddisorder":
+			faked("fakeddisorder")
 		case "hostfakesplit":
-			var hf []string
-			altorder := false
-			for _, m := range strings.Split(p.HostfakesplitMod, ",") {
-				m = strings.TrimSpace(m)
+			fn := "hostfakesplit"
+			arg := []string{}
+			for _, x := range splitCSV(p.HostfakesplitMod) {
 				switch {
-				case m == "":
-				case strings.HasPrefix(m, "host="):
-					hf = append(hf, m)
-				case strings.HasPrefix(m, "altorder="):
-					altorder = true
+				case x == "" || x == "none", x == "altorder=0":
+				case strings.HasPrefix(x, "host="):
+					arg = append(arg, x)
+				case x == "altorder=1":
+					fn, m.alt = "f2n_hfs_alt", true
 				default:
-					warns = append(warns, fmt.Sprintf("hostfakesplit-mod=%s — нет аналога в nfqws2, пропущен", m))
+					warnf("hostfakesplit-mod=%s не имеет аналога в nfqws2 — пропущен", x)
 				}
 			}
-			if altorder {
-				warns = append(warns, "hostfakesplit altorder=1 не имеет точного эквивалента в nfqws2 — порядок сегментов будет стандартным (приближение)")
+			if p.HostfakesplitMidhost != "" {
+				arg = append(arg, "midhost="+p.HostfakesplitMidhost)
 			}
-			parts := append([]string{}, hf...)
-			parts = append(parts, seqovl(), pattern(p.SeqOvlPattern))
-			parts = append(parts, foolingParts()...)
-			if v := ipID(); v != "" {
-				parts = append(parts, v)
+			arg = cat(arg, fooling, []string{"tcp_ts_up"}, ipid, repeats, []string{anyf})
+			emit(base, fn, arg...)
+		case "ipfrag2":
+			arg := []string{"ipfrag"}
+			if p.IpfragPosTCP != "" {
+				arg = append(arg, "ipfrag_pos_tcp="+p.IpfragPosTCP)
 			}
-			out.block(payloadUnion(), luaJoin("hostfakesplit", parts...))
+			if p.IpfragPosUDP != "" {
+				arg = append(arg, "ipfrag_pos_udp="+p.IpfragPosUDP)
+			}
+			emit(base, "send", append(arg, anyf)...)
+			emit(base, "drop", anyf)
+		case "udplen":
+			inc := p.UdplenIncrement
+			if inc == "" {
+				inc = "1"
+			}
+			arg := append([]string{"increment=" + inc}, blobArg("pattern", p.UdplenPattern)...)
+			emit(base, "udplen", append(arg, anyf)...)
 		default:
-			warns = append(warns, fmt.Sprintf("mode=%s не поддерживается конвертером — пропущен", mode))
+			warnf("mode=%s не поддерживается конвертером — пропущен", mode)
 		}
 	}
+	return m
+}
 
-	// cutoff → out-range (stock nfqws2 syntax: --out-range=<nN)
+func cat(parts ...[]string) []string {
+	var out []string
+	for _, p := range parts {
+		for _, v := range p {
+			if v != "" {
+				out = append(out, v)
+			}
+		}
+	}
+	return out
+}
+
+func luaJoin(base string, parts ...string) string {
+	out := []string{base}
+	for _, x := range parts {
+		if x != "" {
+			out = append(out, x)
+		}
+	}
+	return strings.Join(out, ":")
+}
+
+func splitCSV(v string) []string {
+	var out []string
+	for _, s := range strings.Split(v, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func isDigits(v string) bool {
+	if v == "" {
+		return false
+	}
+	for _, c := range v {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// numArg переводит 0x-инкременты winws в десятичное число со знаком.
+func numArg(v string) string {
+	if strings.HasPrefix(v, "0x") {
+		if n, err := strconv.ParseInt(v[2:], 16, 64); err == nil {
+			if n > 0x7FFFFFFF {
+				n -= 0x100000000
+			}
+			return strconv.FormatInt(n, 10)
+		}
+	}
+	return v
+}
+
+// foolingArgs: искажения, благодаря которым сервер отбрасывает фейк.
+// Применяются только к фейкам — как и в winws.
+func foolingArgs(p *flowseal.Profile, warnf warnFunc) []string {
+	var out []string
+	for _, f := range p.Fooling {
+		switch f {
+		case "none":
+		case "ts":
+			v := p.TsIncrement
+			if v == "" {
+				v = "-600000"
+			}
+			out = append(out, "tcp_ts="+numArg(v))
+		case "badseq":
+			v, a := p.BadseqIncrement, p.BadackIncrement
+			if v == "" {
+				v = "-10000"
+			}
+			if a == "" {
+				a = "-66000"
+			}
+			out = append(out, "tcp_seq="+numArg(v), "tcp_ack="+numArg(a))
+		case "md5sig":
+			out = append(out, "tcp_md5")
+		case "badsum":
+			out = append(out, "badsum")
+		case "datanoack":
+			out = append(out, "tcp_flags_unset=ACK")
+		case "hopbyhop":
+			out = append(out, "ip6_hopbyhop")
+		case "hopbyhop2":
+			out = append(out, "ip6_hopbyhop2")
+		case "destopt":
+			out = append(out, "ip6_destopt")
+		default:
+			warnf("fooling=%s не имеет прямого аналога в nfqws2 — пропущен", f)
+		}
+	}
+	if p.Ttl != "" {
+		out = append(out, "ip_ttl="+p.Ttl)
+	}
+	if p.Ttl6 != "" {
+		out = append(out, "ip6_ttl="+p.Ttl6)
+	}
+	if p.TCPFlagsSet != "" {
+		out = append(out, "tcp_flags_set="+strings.ToUpper(p.TCPFlagsSet))
+	}
+	if p.TCPFlagsUnset != "" {
+		out = append(out, "tcp_flags_unset="+strings.ToUpper(p.TCPFlagsUnset))
+	}
+	return out
+}
+
+func ipIDArgs(p *flowseal.Profile, warnf warnFunc) []string {
+	switch p.IpID {
+	case "", "seq": // режим nfqws2 по умолчанию
+		return nil
+	case "zero", "rnd":
+		return []string{"ip_id=" + p.IpID}
+	default:
+		warnf("ip-id=%s не поддерживается — используется seq", p.IpID)
+		return nil
+	}
+}
+
+// rangeArg: --dpi-desync-start / --dpi-desync-cutoff → --out-range.
+// start = "по номеру больше или равно N" (включающая граница),
+// cutoff = "по номеру меньше N" (исключающая).
+func rangeArg(p *flowseal.Profile, warnf warnFunc) string {
+	limit := func(v string) (string, bool) {
+		if len(v) < 2 || (v[0] != 'n' && v[0] != 'd' && v[0] != 's') || !isDigits(v[1:]) {
+			return "", false
+		}
+		return v, true
+	}
+	var lo, hi string
+	if p.DesyncStart != "" {
+		if v, ok := limit(p.DesyncStart); ok {
+			lo = v
+		} else {
+			warnf("dpi-desync-start=%s не поддерживается — пропущен", p.DesyncStart)
+		}
+	}
 	if p.Cutoff != "" {
-		out.args = append(out.args, "--out-range=<"+p.Cutoff)
+		if v, ok := limit(p.Cutoff); ok {
+			hi = v
+		} else {
+			warnf("dpi-desync-cutoff=%s не поддерживается — пропущен", p.Cutoff)
+		}
 	}
+	switch {
+	case lo != "" && hi != "" && lo[0] == hi[0]:
+		return lo + "-<" + hi
+	case lo != "" && hi != "":
+		warnf("start и cutoff в разных режимах счётчика — применён только cutoff")
+		return "<" + hi
+	case lo != "":
+		return lo + "-"
+	case hi != "":
+		return "<" + hi
+	}
+	return ""
+}
 
-	// filter-l3 (встречается в EXP): L3-ограничение в nfqws2 делается через IPV6_ENABLED
-	if p.FilterL3 == "ipv4" {
-		warns = append(warns, "профиль ограничен IPv4 (filter-l3=ipv4) — при необходимости задайте IPV6_ENABLED=0 вручную")
-	} else if p.FilterL3 != "" {
-		warns = append(warns, "filter-l3="+p.FilterL3+" не поддерживается — пропущен")
+// convPos: числовые позиции разреза winws сдвигаются на 1 (см. mapProfile),
+// маркеры и отрицательные позиции остаются как есть.
+func convPos(list string) string {
+	var out []string
+	for _, mk := range splitCSV(list) {
+		if n, err := strconv.Atoi(mk); err == nil && n > 0 {
+			mk = strconv.Itoa(n + 1)
+		}
+		out = append(out, mk)
 	}
-	return out, warns
+	return strings.Join(out, ",")
+}
+
+// fakedPos: fakedsplit/fakeddisorder режут по одной позиции.
+func fakedPos(list string) (string, bool) {
+	ms := splitCSV(list)
+	if len(ms) < 2 {
+		return convPos(list), false
+	}
+	for _, x := range ms {
+		if _, err := strconv.Atoi(x); err != nil {
+			return x, true
+		}
+	}
+	return convPos(ms[0]), true
+}
+
+// splitTLSMod делит --dpi-desync-fake-tls-mod на однократные (при старте)
+// и повторяющиеся (на каждый запрос) моды.
+func splitTLSMod(mod string, warnf warnFunc) (string, string) {
+	var sni, rndsni, rt []string
+	for _, x := range splitCSV(mod) {
+		switch {
+		case x == "" || x == "none":
+		case x == "rndsni":
+			rndsni = append(rndsni, x)
+		case strings.HasPrefix(x, "sni=") && safeLuaString(x):
+			sni = append(sni, x)
+		case x == "rnd" || x == "dupsid" || x == "padencap":
+			rt = append(rt, x)
+		default:
+			warnf("fake-tls-mod=%s не поддерживается — пропущен", x)
+		}
+	}
+	return strings.Join(append(sni, rndsni...), ","), strings.Join(rt, ",")
+}
+
+// safeLuaString: значение уйдёт в lua-строку в одинарных кавычках внутри конфига
+func safeLuaString(v string) bool {
+	return !strings.ContainsAny(v, "'\"`$\\ \t")
+}
+
+func fakedsplitAlt(mod string, warnf warnFunc) []string {
+	var out []string
+	for _, x := range splitCSV(mod) {
+		if x == "" || x == "none" {
+			continue
+		}
+		if !strings.HasPrefix(x, "altorder=") {
+			warnf("fakedsplit-mod=%s не поддерживается — пропущен", x)
+			continue
+		}
+		n, err := strconv.Atoi(x[len("altorder="):])
+		if err != nil || n < 0 || n > 19 {
+			warnf("fakedsplit-mod=%s не поддерживается — пропущен", x)
+			continue
+		}
+		switch n % 8 {
+		case 1:
+			out = append(out, "nofake1")
+		case 2:
+			out = append(out, "nofake1", "nofake2")
+		case 3:
+			out = append(out, "nofake1", "nofake2", "nofake4")
+		}
+		if n >= 8 {
+			warnf("fakedsplit-mod=%s: вариант для пакетов без позиции разреза в nfqws2 не воспроизводится", x)
+		}
+	}
+	return out
+}
+
+// visibleKinds: протоколы, которые профиль вообще может увидеть.
+// winws выбирает фейк по протоколу пакета, поэтому для каждого такого протокола
+// нужен свой фейк (свой или встроенный).
+func visibleKinds(p *flowseal.Profile) []string {
+	tcp := len(p.FilterTCP) > 0 || len(p.FilterUDP) == 0
+	udp := len(p.FilterUDP) > 0 || len(p.FilterTCP) == 0
+	if len(p.FilterL7) > 0 {
+		var ks []string
+		for _, l7 := range p.FilterL7 {
+			switch {
+			case l7 == "unknown":
+				if udp {
+					ks = append(ks, "unknownudp")
+				} else if tcp {
+					ks = append(ks, "unknown")
+				}
+			case l7ToKind[l7] != "":
+				ks = append(ks, l7ToKind[l7])
+			}
+		}
+		return ks
+	}
+	var ks []string
+	if tcp {
+		ks = append(ks, "tls", "http")
+		if p.AnyProtocol {
+			ks = append(ks, "unknown")
+		}
+	}
+	if udp {
+		ks = append(ks, "quic", "discord", "stun", "wireguard", "dht")
+		if p.AnyProtocol {
+			ks = append(ks, "unknownudp")
+		}
+	}
+	return ks
 }
 
 // routerLists holds canonical nfqws2 list paths.

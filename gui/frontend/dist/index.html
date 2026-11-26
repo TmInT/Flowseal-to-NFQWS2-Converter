@@ -49,6 +49,21 @@ textarea {
   border-radius: 8px; padding: 8px; font: 12px/1.4 Consolas, monospace; resize: vertical; outline: none; white-space: pre; }
 .note { color: var(--dim); font-size: 12px; margin-top: 8px; }
 .cardfooter { text-align: right; color: #5a6070; font-size: 11px; padding-top: 6px; user-select: none; }
+.stratlist { flex: 1; display: flex; flex-wrap: wrap; gap: 4px 12px; max-height: 104px; overflow: auto; font-size: 12px; }
+.stratlist label { display: flex; align-items: center; gap: 4px; color: var(--text); cursor: pointer; white-space: nowrap; }
+.stratlist a, .res a { color: var(--accent); cursor: pointer; }
+#testres { overflow: auto; flex: 1 1 0; min-height: 120px; margin-bottom: 8px; font-size: 12px; }
+.card.hastest #out { flex: none; height: 150px; min-height: 150px; }
+.res { width: 100%; border-collapse: collapse; }
+.res th { text-align: left; color: var(--dim); font-weight: 600; padding: 4px 6px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.res td { padding: 4px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.res tr.best td { background: rgba(70,194,110,.12); }
+.res tr.dead td { color: var(--dim); }
+.res tr.strategy { cursor: pointer; }
+.st { display: inline-block; min-width: 46px; text-align: center; border-radius: 3px; padding: 1px 3px; font-size: 11px; font-family: Consolas, monospace; }
+.st.OK { color: var(--ok); } .st.ERROR, .st.SSL { color: var(--err); } .st.BLOCKED { color: var(--warn); }
+.dim { color: var(--dim); }
+.sc { font-weight: 600; font-size: 13px; white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -59,12 +74,12 @@ textarea {
         <b>1 · Zapret (Flowseal) на ПК</b>
         <div class="row">
           <label>Папка</label>
-          <input type="text" id="dir" onchange="refreshBats()">
+          <input type="text" id="dir" placeholder="например: C:\zapret-discord-youtube-1.10.4" onchange="refreshBats()">
           <button onclick="pickFolder('dir')">Обзор…</button>
         </div>
         <div class="row">
           <label>Стратегия</label>
-          <select id="bat"></select>
+          <select id="bat" title="Файл .bat из папки zapret. Список появится после указания папки"></select>
         </div>
         <div class="row">
           <label>Интерфейс</label><input type="text" id="iface" value="eth3">
@@ -143,15 +158,37 @@ textarea {
           <button onclick="doLoadList()">Отменить правки</button>
         </div>
       </div>
+
+      <div class="section">
+        <b>5 · Тест стратегий на роутере</b>
+        <div class="note" style="margin:0 0 8px">По очереди ставит каждую стратегию на роутер и проверяет её с этого ПК: Discord, YouTube, Google (HTTP, TLS 1.2/1.3, ping) и устойчивость к заморозке после 16–20 КБ. Затем возвращает прежний конфиг. Пока идёт тест, обход для всей сети работает по проверяемой стратегии.</div>
+        <div class="row">
+          <label>Стратегии</label>
+          <div id="stratlist" class="stratlist"></div>
+        </div>
+        <div class="row">
+          <label>Повторы</label>
+          <select id="rounds" style="flex:none; width:64px" title="Сколько раз проверять каждую цель. Результаты плавающие — если итоги странные, повторите с двумя-тремя повторами"><option value="1" selected>1</option><option value="2">2</option><option value="3">3</option></select>
+          <div class="check" title="Сначала замер с остановленным nfqws2: показывает, что реально заблокировано без обхода, и что стратегия ломает"><input type="checkbox" id="baseline" checked><span>Базовый замер</span></div>
+          <div class="check" title="Набор dpi-checkers: POST 64 КБ на ~36 хостов, ищет заморозку после 16–20 КБ"><input type="checkbox" id="dpicheck" checked><span>DPI checkers</span></div>
+        </div>
+        <div class="row">
+          <button class="primary" id="testBtn" onclick="doTest()">Запустить тест</button>
+          <button class="danger" id="testCancelBtn" onclick="doTestCancel()" disabled title="Остановить после текущей стратегии и вернуть прежний конфиг">Остановить</button>
+          <button id="testReportBtn" onclick="saveTestReport()" disabled title="Сохранить итоги в текстовый файл">Отчёт…</button>
+        </div>
+        <div id="pending" class="note" style="display:none;color:var(--warn)"></div>
+      </div>
     </div>
   </div>
 
   <div class="col">
-    <div class="card" style="flex:1; display:flex; flex-direction:column;">
+    <div class="card" id="rescard" style="flex:1; display:flex; flex-direction:column;">
       <h2>Результат</h2>
       <div class="progress" id="progwrap" style="display:none"><div id="progbar"></div></div>
       <div id="progtext"></div>
       <div id="badges"></div>
+      <div id="testres" style="display:none"></div>
       <textarea id="out" spellcheck="false" placeholder="Здесь появится конфиг и лог операций…"></textarea>
       <div class="cardfooter"><span id="appver"></span>Developed by TmInT</div>
     </div>
@@ -196,16 +233,29 @@ async function loadSettings() {
 }
 async function refreshBats() {
   const dir = $("dir").value.trim();
-  if (!dir) return;
+  if (!dir) { batPlaceholder("например: general (ALT11).bat"); return; }
   try {
-    const bats = await window.go.main.App.ListBats(dir);
+    const bats = (await window.go.main.App.ListBats(dir)) || [];
     const sel = $("bat"), cur = sel.value || settings.bat;
     sel.innerHTML = "";
-    (bats || []).forEach(b => { const o = document.createElement("option"); o.textContent = b; o.value = b; sel.appendChild(o); });
+    if (!bats.length) { batPlaceholder("пресеты не найдены"); status("В папке нет .bat-пресетов", "warn"); return; }
+    batFilled();
+    bats.forEach(b => { const o = document.createElement("option"); o.textContent = b; o.value = b; sel.appendChild(o); });
     if (cur && bats.includes(cur)) sel.value = cur;
-    status("Пресетов найдено: " + (bats ? bats.length : 0));
-  } catch (e) { status("Папка недоступна: " + e, "warn"); }
+    status("Пресетов найдено: " + bats.length);
+    refreshStratList();
+  } catch (e) { batPlaceholder("например: general (ALT11).bat"); status("Папка недоступна: " + e, "warn"); }
 }
+// пустой select не умеет placeholder — показываем пример приглушённой строкой
+function batPlaceholder(text) {
+  const sel = $("bat");
+  sel.innerHTML = "";
+  const o = document.createElement("option");
+  o.textContent = text; o.value = ""; o.disabled = true;
+  sel.appendChild(o); sel.style.color = "var(--dim)";
+  refreshStratList();
+}
+function batFilled() { $("bat").style.color = ""; }
 async function pickFolder(target) {
   try {
     const dir = await window.go.main.App.PickFolder();
@@ -249,8 +299,9 @@ function setProgress(step, total, msg) {
 }
 window.addEventListener("DOMContentLoaded", () => {
   try { window.runtime.EventsOn("deploy:progress", d => { setProgress(d.step, d.total, d.msg); log(d.msg); }); } catch (e) {}
+  try { window.runtime.EventsOn("test:progress", d => { setProgress(d.step, d.total, d.msg); log(d.msg); }); } catch (e) {}
   try { window.go.main.App.Version().then(v => { if (v) $("appver").textContent = v + " · "; }); } catch (e) {}
-  loadSettings();
+  loadSettings().then(() => { refreshBats(); checkPending(); });
 });
 async function doDeploy() {
   if (!confirm("Установить конфиг на роутер? Предыдущий будет сохранён как .bak-f2n-*")) return;
@@ -305,6 +356,144 @@ async function doLog() {
     const out = await window.go.main.App.RouterLog(router(), 50);
     $("out").value = "=== /opt/var/log/nfqws2.log (последние 50) ===\n" + out;
   } catch (e) { status("Ошибка: " + e, "err"); }
+}
+
+// ---- 5 · тест стратегий ----
+let testReport = null;
+function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+function st(s) { return s ? '<span class="st ' + (s === "OK" || s === "BLOCKED" ? s : "ERROR") + '">' + s + "</span>" : "<span class='dim'>—</span>"; }
+function refreshStratList() {
+  const box = $("stratlist"), sel = $("bat");
+  const names = Array.from(sel.options).filter(o => o.value).map(o => o.value);
+  box.innerHTML = "";
+  if (!names.length) { box.innerHTML = "<span class='dim'>появятся после указания папки в п. 1</span>"; return; }
+  names.forEach(n => {
+    const l = document.createElement("label");
+    const c = document.createElement("input"); c.type = "checkbox"; c.value = n; c.checked = true; c.title = n;
+    l.appendChild(c); l.appendChild(document.createTextNode(n.replace(/\.bat$/i, "")));
+    box.appendChild(l);
+  });
+  const tools = document.createElement("span");
+  tools.innerHTML = "<a onclick='stratAll(true)'>все</a> · <a onclick='stratAll(false)'>снять</a>";
+  box.appendChild(tools);
+}
+function stratAll(on) { document.querySelectorAll("#stratlist input").forEach(c => c.checked = on); }
+function testBusy(on) {
+  busy(on);
+  $("testBtn").disabled = on; $("testCancelBtn").disabled = !on;
+}
+async function doTest() {
+  const dir = $("dir").value.trim();
+  const strat = Array.from(document.querySelectorAll("#stratlist input:checked")).map(c => c.value);
+  if (!dir || !strat.length) { status("Укажите папку zapret в п. 1 и выберите хотя бы одну стратегию", "warn"); return; }
+  const rounds = Math.max(1, parseInt($("rounds").value) || 1);
+  const per = $("dpicheck").checked ? 30 + 6 * rounds : 8 * rounds; // секунд на стратегию, по опыту
+  const mins = Math.max(1, Math.round(strat.length * per / 60) + ($("baseline").checked ? 1 : 0));
+  if (!confirm("Проверить стратегий: " + strat.length + ", примерно " + mins + " мин.\n\nКаждая по очереди встанет на роутер — на это время обход всей сети будет работать по ней. Прежний конфиг и списки вернутся автоматически.\n\nПродолжить?")) return;
+  testBusy(true); testReport = null;
+  $("testres").style.display = "none"; $("rescard").classList.remove("hastest"); $("testReportBtn").disabled = true;
+  $("out").value = ""; status("Тест стратегий…");
+  try {
+    testReport = await window.go.main.App.TestStrategies(router(), {
+      dir, iface: $("iface").value.trim(), policy: $("policy").value.trim(), gf: $("gf").value,
+      strategies: strat, baseline: $("baseline").checked, dpi: $("dpicheck").checked, rounds });
+    renderTestResults();
+  } catch (e) { status("Ошибка теста: " + e, "err"); log("ОШИБКА: " + e); }
+  finally { testBusy(false); checkPending(); }
+}
+function doTestCancel() { try { window.go.main.App.CancelTest(); status("Остановка после текущей стратегии…"); } catch (e) {} }
+function baseRow(b) {
+  return "<tr><td>—</td><td class='name'>Без обхода (базовый замер)</td><td class='sc'>" + b.score + "</td><td>" + b.standardOk + "/" + b.standardTotal +
+    "</td><td>" + b.pingOk + "</td><td class='dim'>—</td><td class='dim'>—</td><td>" + (b.dpiTotal ? b.dpiOk + "/" + b.dpiTotal + " ⌛" + b.dpiBlocked : "—") + "</td><td></td></tr>";
+}
+function details(s) {
+  let h = "<table class='res'><tr><th>Цель</th><th>HTTP</th><th>TLS 1.2</th><th>TLS 1.3</th><th>Ping</th></tr>";
+  (s.targets || []).forEach(t => {
+    h += "<tr><td>" + esc(t.name) + "</td><td>" + st(t.http) + "</td><td>" + st(t.tls12) + "</td><td>" + st(t.tls13) + "</td><td>" +
+      (t.pingOk ? t.pingMs + " мс" : "<span class='st ERROR'>таймаут</span>") + "</td></tr>";
+  });
+  h += "</table>";
+  if (s.dpi && s.dpi.length) {
+    h += "<div style='margin-top:6px'><b>DPI checkers:</b> откликнулись " + s.dpiOk + " из " + s.dpiTotal +
+      (s.dpiBlocked ? ", заморозка после отправки — " + s.dpiBlocked : "") + "</div>";
+    const bad = s.dpi.filter(d => d.http !== "OK" || d.tls12 !== "OK" || d.tls13 !== "OK");
+    if (bad.length) {
+      h += "<table class='res'>";
+      bad.forEach(d => { h += "<tr><td>" + d.country + " " + esc(d.host) + " <span class='dim'>" + esc(d.provider) + "</span></td><td>" + st(d.http) + "</td><td>" + st(d.tls12) + "</td><td>" + st(d.tls13) + "</td></tr>"; });
+      h += "</table>";
+    }
+  }
+  if (s.note) h += "<div class='note'>" + esc(s.note) + "</div>";
+  return h;
+}
+function toggleRow(i) { const d = $("det" + i); if (d) d.style.display = d.style.display === "none" ? "" : "none"; }
+function pickStrategy(name) {
+  const sel = $("bat");
+  Array.from(sel.options).forEach(o => { if (o.value === name || o.value + ".bat" === name) sel.value = o.value; });
+  status("В п. 1 выбрана стратегия " + name.replace(/\.bat$/i, "") + " — «Конвертировать» или «Установить на роутер»", "ok");
+}
+function renderTestResults() {
+  const r = testReport; if (!r) return;
+  const warn = (r.warnings || []).map(w => "⚠ " + w).join("\n");
+  if (r.fatal) log("ОШИБКА: " + r.fatal);
+  if (warn) log(warn);
+  const rows = (r.results || []).map((s, i) => {
+    const dead = !s.started;
+    return "<tr class='strategy " + (s.best ? "best" : "") + (dead ? " dead" : "") + "' onclick='toggleRow(" + i + ")'>" +
+      "<td>" + (s.rank || "") + "</td><td class='name'>" + esc(s.name) + (dead ? "<div class='dim'>" + esc(s.note) + "</div>" : "") + "</td>" +
+      "<td class='sc'>" + s.score + "</td><td>" + s.standardOk + "/" + s.standardTotal + (s.ssl ? " <span class='st SSL'>SSL " + s.ssl + "</span>" : "") + "</td>" +
+      "<td>" + s.pingOk + "</td><td>" + (r.baseline ? s.unblocked : "—") + "</td><td>" + (r.baseline ? s.broken : "—") + "</td>" +
+      "<td>" + (r.withDpi && s.dpiTotal ? s.dpiOk + "/" + s.dpiTotal + (s.dpiBlocked ? " ⌛" + s.dpiBlocked : "") : "—") + "</td>" +
+      "<td><a onclick=\"event.stopPropagation();pickStrategy('" + esc(s.name).replace(/'/g, "") + "')\">выбрать</a></td></tr>" +
+      "<tr id='det" + i + "' style='display:none'><td colspan='9'>" + details(s) + "</td></tr>";
+  }).join("");
+  const best = (r.results || []).find(s => s.best);
+  $("testres").innerHTML =
+    "<div class='note' style='margin:0 0 6px'>Итог = 70% цели (HTTP, TLS 1.2, TLS 1.3) + 30% DPI checkers; строка — подробности." +
+    (r.baseline ? " «Разблок.» — целей, открывшихся там, где без обхода было заблокировано; «Сломано» — наоборот." : "") + "</div>" +
+    "<table class='res'><tr><th>#</th><th>Стратегия</th><th>Итог</th><th>Цели</th><th>Ping</th><th>Разблок.</th><th>Сломано</th><th>DPI</th><th></th></tr>" +
+    (r.baseline ? baseRow(r.baseline) : "") + rows + "</table>" +
+    (r.fatal ? "<div class='note' style='color:var(--err);margin-top:6px'>" + esc(r.fatal) + "</div>" : "") +
+    "<div class='note'>" + (r.restored ? "✓ Прежний конфиг роутера возвращён"
+      : r.touched ? "⚠ Прежний конфиг роутера НЕ возвращён — смотрите сообщение об ошибке"
+      : "Роутер не изменялся: тест остановился до каких-либо действий с ним") +
+    " · " + r.durationS + " с" + (r.cancelled ? " · тест остановлен" : "") + (warn ? "<br>" + esc(warn).replace(/\n/g, "<br>") : "") + "</div>";
+  $("testres").style.display = "block"; $("rescard").classList.add("hastest");
+  $("progwrap").style.display = "none"; $("progtext").textContent = "";
+  $("testReportBtn").disabled = false;
+  if (r.fatal) status("Тест прерван: " + r.fatal, "err");
+  else status(best ? "Тест завершён — лучшая: " + best.name.replace(/\.bat$/i, "") : "Тест завершён", best ? "ok" : "warn");
+}
+function saveTestReport() {
+  const r = testReport; if (!r) return;
+  const L = ["F2N — тест стратегий, " + new Date(r.started).toLocaleString() + ", " + r.durationS + " с"];
+  (r.warnings || []).forEach(w => L.push("  ⚠ " + w));
+  if (r.fatal) L.push("  ОШИБКА: " + r.fatal);
+  L.push("");
+  const line = (label, s) => L.push(label.padEnd(30) + "итог " + String(s.score).padStart(3) + "  цели " + (s.standardOk + "/" + s.standardTotal).padEnd(6) +
+    " ping " + String(s.pingOk).padStart(2) + "  разблок. " + String(s.unblocked).padStart(2) + "  сломано " + String(s.broken).padStart(2) +
+    (s.dpiTotal ? "  DPI " + s.dpiOk + "/" + s.dpiTotal + " (заморозка " + s.dpiBlocked + ")" : "") + (s.note ? "  — " + s.note : ""));
+  if (r.baseline) { line("Без обхода (базовый замер)", r.baseline); L.push(""); }
+  (r.results || []).forEach(s => line(s.rank + ". " + s.name, s));
+  if (r.fatal) L.push("  ОШИБКА: " + r.fatal);
+  L.push("", r.restored ? "Прежний конфиг роутера возвращён." : r.touched ? "Прежний конфиг роутера НЕ возвращён!" : "Роутер не изменялся.");
+  const name = "f2n-test-" + new Date(r.started).toISOString().slice(0, 16).replace(/[-:T]/g, "").replace(/^(\d{4})(\d\d)(\d\d)/, "$3.$2.$1-") + ".txt";
+  window.go.main.App.SaveTextFile(name, L.join("\r\n")).then(p => { if (p) status("Отчёт сохранён: " + p, "ok"); }).catch(e => status("Не удалось сохранить: " + e, "err"));
+}
+async function checkPending() {
+  try {
+    const j = await window.go.main.App.TestPending();
+    const box = $("pending");
+    if (!j) { box.style.display = "none"; return; }
+    box.style.display = "block";
+    box.innerHTML = "⚠ Предыдущий тест стратегий не завершился (с " + new Date(j.started).toLocaleString() + ") — на роутере могла остаться проверяемая стратегия. " +
+      "<a onclick='doTestRestore()' style='color:var(--accent);cursor:pointer'>Вернуть прежний конфиг</a>";
+  } catch (e) {}
+}
+async function doTestRestore() {
+  if (!confirm("Вернуть на роутер конфиг и списки, которые были до прерванного теста?")) return;
+  try { const out = await window.go.main.App.TestRestore(router()); status(out, "ok"); log(out); await checkPending(); }
+  catch (e) { status("Ошибка восстановления: " + e, "err"); log("ОШИБКА: " + e); }
 }
 
 </script>

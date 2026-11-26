@@ -16,3 +16,6 @@
 
 # Windows-скрипты — CRLF
 *.bat eol=crlf
+
+# Встроенный в конфиг Lua-исходник (hex в конфиге) — всегда LF, как golden-файлы
+*.lua eol=lf

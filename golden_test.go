@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,10 +10,14 @@ import (
 	"f2n/internal/convert"
 )
 
+var updateGolden = flag.Bool("update", false, "перезаписать testdata/golden текущим результатом конвертации")
+
 // TestGolden verifies byte-exact conversion output for every committed golden file.
-// If a mapping changes intentionally, regenerate goldens:
-//   convert all presets from testdata/flowseal into testdata/smoke2/<name> and copy
-//   testdata/smoke2/<name>/nfqws2.conf -> testdata/golden/<name>.conf
+// Если маппинг изменился осознанно, перегенерируйте goldens:
+//
+//	go test -run TestGolden -update .
+//
+// Семантику аргументов эти файлы не проверяют — её держат тесты в internal/convert.
 func TestGolden(t *testing.T) {
 	goldenDir := `testdata/golden`
 	entries, err := os.ReadDir(goldenDir)
@@ -25,12 +30,6 @@ func TestGolden(t *testing.T) {
 	for _, e := range entries {
 		name := strings.TrimSuffix(e.Name(), ".conf")
 		t.Run(name, func(t *testing.T) {
-			want, err := os.ReadFile(filepath.Join(goldenDir, e.Name()))
-			if err != nil {
-				t.Fatal(err)
-			}
-			// git на разных платформах может выгружать файлы с CRLF — нормализуем
-			normalize := func(s string) string { return strings.ReplaceAll(s, "\r\n", "\n") }
 			opts := convert.Options{
 				FlowsealDir: `testdata/flowseal`,
 				BatFile:     filepath.Join(`testdata/flowseal`, name+".bat"),
@@ -42,6 +41,18 @@ func TestGolden(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			if *updateGolden {
+				if err := os.WriteFile(filepath.Join(goldenDir, e.Name()), []byte(res.Conf), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			want, err := os.ReadFile(filepath.Join(goldenDir, e.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// git на разных платформах может выгружать файлы с CRLF — нормализуем
+			normalize := func(s string) string { return strings.ReplaceAll(s, "\r\n", "\n") }
 			wantStr := normalize(string(want))
 			gotStr := normalize(res.Conf)
 			if gotStr != wantStr {
